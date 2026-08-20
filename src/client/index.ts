@@ -219,7 +219,7 @@ interface EditorViewLike {
       lineAt(pos: number): { from: number; to: number; number: number }
     }
   }
-  dispatch(spec: { selection: { anchor: number; head?: number }; scrollIntoView?: boolean }): void
+  dispatch(spec: { selection: { anchor: number; head?: number }; scrollIntoView?: boolean; effects?: unknown }): void
   domAtPos(pos: number): { node: Node; offset: number }
   posAtCoords(coords: { x: number; y: number }): number | null
 }
@@ -312,13 +312,31 @@ function tryJumpNow(): boolean {
       : Math.max(startLine, Math.min(endLine, doc.lines))
     const start = doc.line(startLine)
     const end = doc.line(lastLine)
-    // Two dispatches: first scroll the START line into view with a collapsed
-    // cursor (a single range dispatch would scroll toward the selection's
-    // end), then extend the selection over the whole range WITHOUT scrolling.
+    const head = end.to > start.from ? end.to : Math.min(start.from + 1, doc.length)
+    // Scroll strategy: prefer CodeMirror's OFFICIAL centered scroll effect
+    // (`EditorView.scrollIntoView(pos, { y: 'center' })`, reached through the
+    // view's own class) — CodeMirror computes the centered target itself, so
+    // there is no animation-frame race against its own scroll settling. Fall
+    // back to minimal scroll + manual next-frame re-centering when the static
+    // is not reachable.
+    let centerEffect: unknown
     try {
-      view.dispatch({ selection: { anchor: start.from }, scrollIntoView: true })
-      const head = end.to > start.from ? end.to : Math.min(start.from + 1, doc.length)
-      view.dispatch({ selection: { anchor: start.from, head } })
+      const ctor = view.constructor as unknown as {
+        scrollIntoView?: (pos: number, options: { y: 'center' }) => unknown
+      }
+      centerEffect = ctor.scrollIntoView?.(start.from, { y: 'center' })
+    } catch {
+      centerEffect = undefined
+    }
+    let usedEffect = false
+    try {
+      if (centerEffect !== undefined) {
+        view.dispatch({ selection: { anchor: start.from, head }, effects: centerEffect })
+        usedEffect = true
+      } else {
+        view.dispatch({ selection: { anchor: start.from }, scrollIntoView: true })
+        view.dispatch({ selection: { anchor: start.from, head } })
+      }
     } catch {
       // A dispatch surface drift must never break the click — the file is
       // already open at that point.
@@ -328,11 +346,15 @@ function tryJumpNow(): boolean {
     // (and whether it renders at all depends on the editor's drawSelection
     // setup), so the overlay — independent of focus — marks the lines.
     const lineEl = highlightTargetLines(view, startLine, lastLine)
-    if (lineEl !== null) {
-      // Center after CodeMirror's own minimal scroll settles: the next-frame
-      // adjustment recomputes from live rects, so the final position is
-      // mid-viewport rather than parked at an edge.
-      window.requestAnimationFrame(() => { centerLineElement(lineEl) })
+    if (lineEl !== null && !usedEffect) {
+      // Manual fallback path only (the effect path already centered): apply
+      // on successive frames AND once after 150ms — each pass recomputes
+      // from live rects, so the last writer is our centering rather than
+      // CodeMirror's minimal scroll.
+      const center = (): void => centerLineElement(lineEl)
+      window.requestAnimationFrame(center)
+      window.requestAnimationFrame(() => { window.requestAnimationFrame(center) })
+      window.setTimeout(center, 150)
     }
     pending = null
     return true
