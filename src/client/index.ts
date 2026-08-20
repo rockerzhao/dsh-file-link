@@ -1,7 +1,8 @@
 /**
  * dsh-file-link client half.
  *
- * Makes `file:line`, `file:line:col` and `file#L123` references in chat
+ * Makes `file:line`, `file:line:col`, `file:start-end` and `file#L123`
+ * references in chat
  * replies clickable: a click opens the file in the dsh-better-sidebar editor
  * and jumps to the requested line. Bare file paths (absolute, or containing a
  * path separator) are also clickable and open without a jump.
@@ -87,6 +88,7 @@ interface Ctx {
 interface FileRef {
   path: string
   line?: number
+  endLine?: number
   column?: number
 }
 
@@ -108,16 +110,28 @@ function parseFileRef(raw: string): FileRef | null {
   const text = raw.trim()
   if (text === '' || text.length > 512) return null
 
-  // GitHub-style `path#L123` (also tolerate `path#L123-L456`).
-  const hash = /^(.*?)#L(\d+)(?:-L?\d+)?$/.exec(text)
+  // GitHub-style `path#L123` (also `path#L123-L456` ranges).
+  const hash = /^(.*?)#L(\d+)(?:-L?(\d+))?$/.exec(text)
   if (hash !== null && looksLikePath(hash[1]!)) {
-    return { path: hash[1]!, line: Number(hash[2]) }
+    return {
+      path: hash[1]!,
+      line: Number(hash[2]),
+      endLine: hash[3] !== undefined ? Number(hash[3]) : undefined,
+    }
   }
 
   // `path:line:column`
   const col = /^(.*):(\d+):(\d+)$/.exec(text)
   if (col !== null && looksLikePath(col[1]!)) {
     return { path: col[1]!, line: Number(col[2]), column: Number(col[3]) }
+  }
+
+  // `path:startLine-endLine` (a line range; reversed bounds are normalized)
+  const range = /^(.*):(\d+)-(\d+)$/.exec(text)
+  if (range !== null && looksLikePath(range[1]!)) {
+    const a = Number(range[2])
+    const b = Number(range[3])
+    return { path: range[1]!, line: Math.min(a, b), endLine: Math.max(a, b) }
   }
 
   // `path:line` (the trailing `:digits` is the line, not a drive letter)
@@ -197,9 +211,17 @@ function forceRightPanelLanding(bs: BetterSidebarService): void {
 // ── CodeMirror jump (via the public `.cmTile` DOM handle) ───────────────────
 
 interface EditorViewLike {
-  state: { doc: { length: number; lines: number; line(n: number): { from: number; to: number } } }
-  dispatch(spec: { selection: { anchor: number; head?: number }; scrollIntoView: boolean }): void
+  state: {
+    doc: {
+      length: number
+      lines: number
+      line(n: number): { from: number; to: number }
+      lineAt(pos: number): { from: number; to: number; number: number }
+    }
+  }
+  dispatch(spec: { selection: { anchor: number; head?: number }; scrollIntoView?: boolean }): void
   domAtPos(pos: number): { node: Node; offset: number }
+  posAtCoords(coords: { x: number; y: number }): number | null
 }
 
 /** Walk up from a `.cm-content` element reading CodeMirror's `cmTile` handle. */
@@ -252,6 +274,7 @@ interface PendingJump {
   bs: BetterSidebarService
   absolute: string
   line: number
+  endLine?: number
 }
 
 let pending: PendingJump | null = null
@@ -259,7 +282,7 @@ let pending: PendingJump | null = null
 /** Try once to find the target editor and jump; true when settled. */
 function tryJumpNow(): boolean {
   if (pending === null) return false
-  const { bs, absolute, line } = pending
+  const { bs, absolute, line, endLine } = pending
 
   // Wait until the target file's tab is the displayed tab of its pane, so we
   // never jump a stale editor from before the tab switch.
@@ -281,27 +304,30 @@ function tryJumpNow(): boolean {
     if (view === null) continue
     const doc = view.state.doc
     if (doc.length === 0) continue
-    if (line < 1 || line > doc.lines) {
-      pending = null // out of range: settle silently
-      return true
-    }
-    const lineInfo = doc.line(line)
-    // Select the WHOLE line so the landing is unmistakable; an empty line
-    // selects its newline so it still shows a highlight.
-    const head = lineInfo.to > lineInfo.from
-      ? lineInfo.to
-      : Math.min(lineInfo.from + 1, doc.length)
+    // Clamp the range into the document (friendlier than bailing on a
+    // partially out-of-range request like :74-1000).
+    const startLine = Math.max(1, Math.min(line, doc.lines))
+    const lastLine = endLine === undefined
+      ? startLine
+      : Math.max(startLine, Math.min(endLine, doc.lines))
+    const start = doc.line(startLine)
+    const end = doc.line(lastLine)
+    // Two dispatches: first scroll the START line into view with a collapsed
+    // cursor (a single range dispatch would scroll toward the selection's
+    // end), then extend the selection over the whole range WITHOUT scrolling.
     try {
-      view.dispatch({ selection: { anchor: lineInfo.from, head }, scrollIntoView: true })
+      view.dispatch({ selection: { anchor: start.from }, scrollIntoView: true })
+      const head = end.to > start.from ? end.to : Math.min(start.from + 1, doc.length)
+      view.dispatch({ selection: { anchor: start.from, head } })
     } catch {
       // A dispatch surface drift must never break the click — the file is
       // already open at that point.
     }
-    // The visible landing marker: a self-drawn full-line highlight. The
-    // editor's own selection is near-invisible while unfocused (and whether
-    // it renders at all depends on the editor's drawSelection setup), so the
-    // overlay — independent of focus — is what makes the line unmistakable.
-    const lineEl = highlightTargetLine(view, lineInfo.from)
+    // The visible landing marker: a self-drawn per-line highlight over the
+    // range. The editor's own selection is near-invisible while unfocused
+    // (and whether it renders at all depends on the editor's drawSelection
+    // setup), so the overlay — independent of focus — marks the lines.
+    const lineEl = highlightTargetLines(view, startLine, lastLine)
     if (lineEl !== null) {
       // Center after CodeMirror's own minimal scroll settles: the next-frame
       // adjustment recomputes from live rects, so the final position is
@@ -315,8 +341,8 @@ function tryJumpNow(): boolean {
 }
 
 /** Poll until the async editor mount lets us jump (or a deadline passes). */
-function scheduleJump(bs: BetterSidebarService, absolute: string, line: number): void {
-  pending = { bs, absolute, line }
+function scheduleJump(bs: BetterSidebarService, absolute: string, line: number, endLine?: number): void {
+  pending = { bs, absolute, line, endLine }
   const deadline = Date.now() + 5000
   const tick = (): void => {
     if (pending === null) return
@@ -335,24 +361,67 @@ function scheduleJump(bs: BetterSidebarService, absolute: string, line: number):
 
 const LINE_CLASS = 'dsh-file-link-line'
 
-let highlightedLine: HTMLElement | null = null
+interface ActiveRange {
+  scroller: HTMLElement
+  view: EditorViewLike
+  start: number
+  end: number
+  onScroll: () => void
+}
 
-/** Drop the current line highlight (called when a new jump lands). */
+let activeRange: ActiveRange | null = null
+let paintQueued = false
+
+/** Drop the current range highlight (called when a new jump lands). */
 function clearLineHighlight(): void {
-  if (highlightedLine !== null) {
-    highlightedLine.classList.remove(LINE_CLASS)
-    highlightedLine = null
+  if (activeRange !== null) {
+    activeRange.scroller.removeEventListener('scroll', activeRange.onScroll)
+    activeRange = null
+  }
+  // Sweep any straggler classes (also covers detached nodes from old panes).
+  for (const el of Array.from(document.querySelectorAll(`.${LINE_CLASS}`))) {
+    el.classList.remove(LINE_CLASS)
+  }
+}
+
+/** Re-paint the overlay on the RENDERED lines inside the active range. */
+function paintRangeLines(): void {
+  paintQueued = false
+  const ar = activeRange
+  if (ar === null) return
+  const doc = ar.view.state.doc
+  for (const raw of Array.from(ar.scroller.querySelectorAll('.cm-line'))) {
+    const el = raw as HTMLElement
+    const rect = el.getBoundingClientRect()
+    let pos: number | null = null
+    try {
+      pos = ar.view.posAtCoords({ x: rect.left + 1, y: rect.top + rect.height / 2 })
+    } catch {
+      pos = null
+    }
+    if (pos === null) continue
+    let num = 0
+    try {
+      num = doc.lineAt(pos).number
+    } catch {
+      continue
+    }
+    if (num >= ar.start && num <= ar.end) el.classList.add(LINE_CLASS)
   }
 }
 
 /**
- * Paint the target line with the overlay class. The highlight PERSISTS until
- * the next jump lands (IDE-selection semantics — it never times out).
- * @returns the highlighted `.cm-line` element, or null when not found.
+ * Paint the overlay over a line range [startLine, endLine]. CodeMirror
+ * virtualizes lines (only the rendered window exists in the DOM), so the
+ * overlay is painted per rendered line and refreshed on scroller scroll —
+ * lines entering the viewport pick up the class as they render. The overlay
+ * PERSISTS until the next jump lands (IDE-selection semantics).
+ * @returns the START line's `.cm-line` element, or null when not found.
  */
-function highlightTargetLine(view: EditorViewLike, from: number): HTMLElement | null {
+function highlightTargetLines(view: EditorViewLike, startLine: number, endLine: number): HTMLElement | null {
   let node: HTMLElement | null = null
   try {
+    const from = view.state.doc.line(startLine).from
     const loc = view.domAtPos(from)
     node = loc.node instanceof HTMLElement ? loc.node : loc.node.parentElement
     for (let depth = 0; depth < 6 && node !== null; depth += 1) {
@@ -360,9 +429,17 @@ function highlightTargetLine(view: EditorViewLike, from: number): HTMLElement | 
       node = node.parentElement
     }
     if (node === null || !node.classList.contains('cm-line')) return null
+    const scrollerEl = node.closest('.cm-scroller')
+    if (scrollerEl === null) return null
     clearLineHighlight()
-    node.classList.add(LINE_CLASS)
-    highlightedLine = node
+    const onScroll = (): void => {
+      if (paintQueued) return
+      paintQueued = true
+      window.requestAnimationFrame(paintRangeLines)
+    }
+    activeRange = { scroller: scrollerEl as HTMLElement, view, start: startLine, end: endLine, onScroll }
+    scrollerEl.addEventListener('scroll', onScroll, { passive: true })
+    paintRangeLines()
     return node
   } catch {
     // Best-effort decoration: never break the jump on a DOM drift.
@@ -408,12 +485,14 @@ function openRef(ctx: Ctx, ref: FileRef): void {
       title: basename(absolute),
       path: absolute,
       id: `editor:${absolute}`,
-      meta: ref.line !== undefined ? { line: ref.line, column: ref.column } : undefined,
+      meta: ref.line !== undefined
+        ? { line: ref.line, endLine: ref.endLine, column: ref.column }
+        : undefined,
     },
     sessionId !== undefined ? { sessionId, cwd } : undefined,
   )
 
-  if (ref.line !== undefined) scheduleJump(bs, absolute, ref.line)
+  if (ref.line !== undefined) scheduleJump(bs, absolute, ref.line, ref.endLine)
 }
 
 // ── Click delegation ────────────────────────────────────────────────────────
@@ -461,9 +540,11 @@ function injectStyles(): HTMLStyleElement {
 }
 
 function tooltipFor(ref: FileRef): string {
-  return ref.line !== undefined
-    ? `打开并跳到第 ${ref.line} 行 · open at line ${ref.line}`
-    : '打开文件 · open file'
+  if (ref.line === undefined) return '打开文件 · open file'
+  const range = ref.endLine !== undefined && ref.endLine !== ref.line
+    ? `${ref.line}-${ref.endLine}`
+    : `${ref.line}`
+  return `打开并选中第 ${range} 行 · open lines ${range}`
 }
 
 /** Decorate one <code> element when its text parses as a file reference. */

@@ -11,6 +11,7 @@ Clickable `file:line` references in DeepSeek Harness replies — click to open t
 | `` `D:\Project\idata2\ci\common\utils.sh:3` `` | 打开文件并跳到第 3 行 |
 | `` `src/foo.ts:12:5` `` | 打开文件并跳到第 12 行第 5 列 |
 | `` `src/foo.ts#L42` `` | 打开文件并跳到第 42 行 |
+| `` `src/foo.go:74-100` `` | 打开文件并选中 74–100 行 |
 | `` `D:\Project\...\utils.sh` `` | 只打开文件（不跳行） |
 
 路径可以是 Windows / POSIX 绝对路径，或相对于当前会话工作区的相对路径。
