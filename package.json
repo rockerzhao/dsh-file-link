@@ -1,6 +1,6 @@
 {
   "name": "dsh-file-link",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Clickable file:line references in DSH replies — click a path like utils.sh:3 to open it in the dsh-better-sidebar editor and jump to that line.",
   "type": "module",
   "repository": {

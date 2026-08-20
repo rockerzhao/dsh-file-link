@@ -6,14 +6,22 @@
  * and jumps to the requested line. Bare file paths (absolute, or containing a
  * path separator) are also clickable and open without a jump.
  *
- * `dsh-better-sidebar` is an OPTIONAL peer: when present the file opens in its
- * editor and jumps to the line; when absent we fall back to the host's system
- * open (`workspaces.openPath`), matching the default DSH behavior.
+ * Behavior notes:
+ * - Styling: a MutationObserver decorates matching inline <code> elements
+ *   with a link look (business blue + pointer + hover underline) and a
+ *   tooltip, so references are discoverable; re-applied after re-renders.
+ * - Landing: better-sidebar's openTab lands in the ACTIVE pane — when that
+ *   pane lives in the bottom panel we first activate a right-panel tab so the
+ *   file always lands in the right sidebar.
+ * - Jump: the target line is selected as a RANGE (whole line highlighted)
+ *   and scrolled into view, so the landing line is unmistakable. The editor
+ *   is located through the editor host's path input (`input[title=path]`)
+ *   when possible, falling back to the first visible CodeMirror instance.
  *
- * The jump reuses the editor's own CodeMirror view through the public
- * `EditorView.findFromDOM` trick — CodeMirror writes a plain `cmTile` property
- * on its content DOM, so we can reach `view.state.doc` and `view.dispatch`
- * without importing any CodeMirror package or forking the editor.
+ * `dsh-better-sidebar` is an OPTIONAL peer: when present the file opens in its
+ * editor and jumps; when absent we fall back to the host's system open.
+ * CodeMirror is reached through the public `cmTile` DOM handle — no
+ * CodeMirror dependency, no editor fork.
  */
 
 export const inject = ['sessions', 'workspaces']
@@ -34,6 +42,25 @@ interface WorkspacesService {
   openPath(path: string): Promise<void>
 }
 
+interface TabLike {
+  id: string
+  path?: string
+}
+
+interface SplitNodeLike {
+  kind: 'leaf' | 'split'
+  id: string
+  tabs?: TabLike[]
+  active?: string | null
+  children?: SplitNodeLike[]
+}
+
+interface SidebarStateLike {
+  activePane: string | null
+  splits: SplitNodeLike
+  bottomSplits: SplitNodeLike
+}
+
 interface OpenTabSeed {
   type: string
   title?: string
@@ -44,6 +71,8 @@ interface OpenTabSeed {
 
 interface BetterSidebarService {
   openTab(seed: OpenTabSeed, scope?: { sessionId: string; cwd?: string }): void
+  activateTab(tabId: string, scope?: { sessionId: string }): void
+  getSnapshot(): { sessionId?: string; state?: SidebarStateLike }
 }
 
 interface Ctx {
@@ -123,13 +152,53 @@ function basename(path: string): string {
   return at === -1 ? path : path.slice(at + 1)
 }
 
+// ── Sidebar state walking ───────────────────────────────────────────────────
+
+function allLeavesOf(node: SplitNodeLike): SplitNodeLike[] {
+  if (node.kind === 'leaf') return [node]
+  return (node.children ?? []).flatMap(allLeavesOf)
+}
+
+function treeHasId(node: SplitNodeLike, id: string): boolean {
+  if (node.id === id) return true
+  if (node.kind === 'split') return (node.children ?? []).some(child => treeHasId(child, id))
+  return false
+}
+
+/** Whether the target file's tab is the active tab of its pane (i.e. displayed). */
+function targetTabActive(bs: BetterSidebarService, absolute: string): boolean {
+  const state = bs.getSnapshot().state
+  if (state === undefined) return false
+  for (const leaf of [...allLeavesOf(state.splits), ...allLeavesOf(state.bottomSplits)]) {
+    const tab = (leaf.tabs ?? []).find(candidate => candidate.path === absolute)
+    if (tab !== undefined) return leaf.active === tab.id
+  }
+  return false
+}
+
+/**
+ * The right sidebar must own the landing: better-sidebar's openTab lands in
+ * the ACTIVE pane, so when that pane lives in the bottom panel we activate a
+ * right-panel tab first, moving the active pane into the right tree.
+ */
+function forceRightPanelLanding(bs: BetterSidebarService): void {
+  const state = bs.getSnapshot().state
+  if (state === undefined || state.activePane === null) return
+  if (!treeHasId(state.bottomSplits, state.activePane)) return
+  for (const leaf of allLeavesOf(state.splits)) {
+    const tabs = leaf.tabs ?? []
+    if (tabs.length === 0) continue
+    const tabId = leaf.active ?? tabs[0]!.id
+    bs.activateTab(tabId)
+    return
+  }
+}
+
 // ── CodeMirror jump (via the public `.cmTile` DOM handle) ───────────────────
 
-/** A CodeMirror 6 EditorView, minimally typed (the real instance is the
- *  sidebar editor's own, shared through the DOM `cmTile` property). */
 interface EditorViewLike {
   state: { doc: { length: number; lines: number; line(n: number): { from: number; to: number } } }
-  dispatch(spec: { selection: { anchor: number }; scrollIntoView: boolean }): void
+  dispatch(spec: { selection: { anchor: number; head?: number }; scrollIntoView: boolean }): void
 }
 
 /** Walk up from a `.cm-content` element reading CodeMirror's `cmTile` handle. */
@@ -143,61 +212,104 @@ function editorViewOf(el: HTMLElement): EditorViewLike | null {
   return null
 }
 
-/** Whether an element is currently laid out (the active tab's editor). */
+/** Whether an element is currently laid out (displayed, not display:none). */
 function isVisible(el: HTMLElement): boolean {
   if (el.offsetParent !== null) return true
   const rect = el.getBoundingClientRect()
   return rect.width > 0 && rect.height > 0
 }
 
-let pendingLine: number | null = null
-let pendingColumn: number | null = null
+function cssEscape(value: string): string {
+  const globalCss = (window as unknown as { CSS?: { escape?: (v: string) => string } }).CSS
+  if (globalCss?.escape !== undefined) return globalCss.escape(value)
+  return value.replace(/["\\]/g, '\\$&')
+}
 
-/** Try once to find the active editor and jump; true when settled. */
+/**
+ * Locate the CodeMirror content element for one absolute path: the editor
+ * host's path input carries `title={path}`, so find it and take the nearest
+ * ancestor that contains a `.cm-content`. Returns null when not mounted yet.
+ */
+function editorContentForPath(absolute: string): HTMLElement | null {
+  let input: HTMLElement | null = null
+  try {
+    input = document.querySelector(`input[title="${cssEscape(absolute)}"]`)
+  } catch {
+    return null
+  }
+  if (input === null) return null
+  let node: HTMLElement | null = input
+  for (let depth = 0; depth < 8 && node !== null; depth += 1) {
+    const cm = node.querySelector('.cm-content')
+    if (cm !== null) return cm as HTMLElement
+    node = node.parentElement
+  }
+  return null
+}
+
+interface PendingJump {
+  bs: BetterSidebarService
+  absolute: string
+  line: number
+}
+
+let pending: PendingJump | null = null
+
+/** Try once to find the target editor and jump; true when settled. */
 function tryJumpNow(): boolean {
-  if (pendingLine === null) return false
-  const line = pendingLine
-  const column = pendingColumn
-  const editors = document.querySelectorAll('.cm-content')
-  for (const raw of Array.from(editors)) {
+  if (pending === null) return false
+  const { bs, absolute, line } = pending
+
+  // Wait until the target file's tab is the displayed tab of its pane, so we
+  // never jump a stale editor from before the tab switch.
+  if (!targetTabActive(bs, absolute)) return false
+
+  // Prefer the editor that belongs to this exact path; fall back to the first
+  // visible one (single-pane layouts — the common case).
+  const byPath = editorContentForPath(absolute)
+  const candidates: HTMLElement[] = []
+  if (byPath !== null) candidates.push(byPath)
+  for (const raw of Array.from(document.querySelectorAll('.cm-content'))) {
     const el = raw as HTMLElement
+    if (el !== byPath) candidates.push(el)
+  }
+
+  for (const el of candidates) {
     if (!isVisible(el)) continue
     const view = editorViewOf(el)
     if (view === null) continue
     const doc = view.state.doc
     if (doc.length === 0) continue
-    // Out-of-range line: settle silently (nothing meaningful to scroll to).
     if (line < 1 || line > doc.lines) {
-      pendingLine = null
-      pendingColumn = null
+      pending = null // out of range: settle silently
       return true
     }
     const lineInfo = doc.line(line)
-    const columnClamped = column === null ? 0 : Math.max(0, Math.min(column - 1, lineInfo.to - lineInfo.from))
-    const anchor = lineInfo.from + columnClamped
+    // Select the WHOLE line so the landing is unmistakable; an empty line
+    // selects its newline so it still shows a highlight.
+    const head = lineInfo.to > lineInfo.from
+      ? lineInfo.to
+      : Math.min(lineInfo.from + 1, doc.length)
     try {
-      view.dispatch({ selection: { anchor }, scrollIntoView: true })
+      view.dispatch({ selection: { anchor: lineInfo.from, head }, scrollIntoView: true })
     } catch {
-      // The dispatch surface may drift across versions; a failed jump must
-      // never break the click — the file is already open at that point.
+      // A dispatch surface drift must never break the click — the file is
+      // already open at that point.
     }
-    pendingLine = null
-    pendingColumn = null
+    pending = null
     return true
   }
   return false
 }
 
 /** Poll until the async editor mount lets us jump (or a deadline passes). */
-function scheduleJump(line: number, column?: number): void {
-  pendingLine = line
-  pendingColumn = column ?? null
+function scheduleJump(bs: BetterSidebarService, absolute: string, line: number): void {
+  pending = { bs, absolute, line }
   const deadline = Date.now() + 5000
   const tick = (): void => {
-    if (pendingLine === null) return
+    if (pending === null) return
     if (Date.now() > deadline) {
-      pendingLine = null
-      pendingColumn = null
+      pending = null
       return
     }
     if (tryJumpNow()) return
@@ -215,14 +327,16 @@ function openRef(ctx: Ctx, ref: FileRef): void {
   const cwd = sessionId !== undefined ? snapshot.byId[sessionId]?.cwd : undefined
   const absolute = resolvePath(cwd, ref.path)
 
-  const betterSidebar = ctx.get('betterSidebar') as BetterSidebarService | undefined
-  if (betterSidebar === undefined) {
+  const bs = ctx.get('betterSidebar') as BetterSidebarService | undefined
+  if (bs === undefined) {
     // No sidebar plugin: fall back to the host's default system open.
     void ctx.workspaces.openPath(absolute)
     return
   }
 
-  betterSidebar.openTab(
+  forceRightPanelLanding(bs)
+
+  bs.openTab(
     {
       type: 'editor',
       title: basename(absolute),
@@ -233,7 +347,7 @@ function openRef(ctx: Ctx, ref: FileRef): void {
     sessionId !== undefined ? { sessionId, cwd } : undefined,
   )
 
-  if (ref.line !== undefined) scheduleJump(ref.line, ref.column)
+  if (ref.line !== undefined) scheduleJump(bs, absolute, ref.line)
 }
 
 // ── Click delegation ────────────────────────────────────────────────────────
@@ -264,8 +378,72 @@ function registerClickDelegation(ctx: Ctx): () => void {
   return () => document.removeEventListener('click', onClick, true)
 }
 
+// ── Link styling for matching inline <code> elements ────────────────────────
+
+const LINK_CLASS = 'dsh-file-link'
+
+function injectStyles(): HTMLStyleElement {
+  const tag = document.createElement('style')
+  tag.dataset.plugin = 'dsh-file-link'
+  tag.textContent = [
+    `code.${LINK_CLASS}{color:var(--dsw-alias-state-business-primary,var(--dsw-static-blue-450,#3b82f6));cursor:pointer;}`,
+    `code.${LINK_CLASS}:hover{text-decoration:underline;}`,
+  ].join('\n')
+  document.head.appendChild(tag)
+  return tag
+}
+
+function tooltipFor(ref: FileRef): string {
+  return ref.line !== undefined
+    ? `打开并跳到第 ${ref.line} 行 · open at line ${ref.line}`
+    : '打开文件 · open file'
+}
+
+/** Decorate one <code> element when its text parses as a file reference. */
+function decorate(el: HTMLElement): void {
+  if (el.classList.contains(LINK_CLASS)) return // already decorated
+  const ref = parseFileRef(el.textContent ?? '')
+  if (ref === null) return
+  el.classList.add(LINK_CLASS)
+  el.setAttribute('title', tooltipFor(ref))
+}
+
+/** Scan the whole document once (cheap: parse only undecorated code elements). */
+function scanAll(): void {
+  for (const raw of Array.from(document.querySelectorAll('code'))) {
+    decorate(raw as HTMLElement)
+  }
+}
+
+/**
+ * Keep the decoration alive across React re-renders: a debounced
+ * MutationObserver re-scans after DOM churn (React may reset className on
+ * the elements it owns; the observer re-applies the class + title).
+ */
+function registerStyling(): () => void {
+  if (document.body === null) return () => { /* no-op */ }
+  const tag = injectStyles()
+  let timer: number | null = null
+  const schedule = (): void => {
+    if (timer !== null) return
+    timer = window.setTimeout(() => {
+      timer = null
+      scanAll()
+    }, 150)
+  }
+  const observer = new MutationObserver(schedule)
+  observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+  scanAll()
+  return () => {
+    observer.disconnect()
+    if (timer !== null) window.clearTimeout(timer)
+    tag.remove()
+  }
+}
+
 // ── Plugin body ─────────────────────────────────────────────────────────────
 
 export function apply(ctx: Ctx): void {
   ctx.effect(() => registerClickDelegation(ctx), 'dsh-file-link: click delegation')
+  ctx.effect(() => registerStyling(), 'dsh-file-link: link styling')
 }
