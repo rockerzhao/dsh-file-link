@@ -277,7 +277,18 @@ interface PendingJump {
   endLine?: number
 }
 
+/** A jump whose selection+scroll landed, but whose overlay is not painted yet
+ *  because the target line was outside the rendered viewport (fresh open). */
+interface PendingPaint {
+  view: EditorViewLike
+  contentEl: HTMLElement
+  startLine: number
+  endLine: number
+  deadline: number
+}
+
 let pending: PendingJump | null = null
+let pendingPaint: PendingPaint | null = null
 
 /** Try once to find the target editor and jump; true when settled. */
 function tryJumpNow(): boolean {
@@ -342,22 +353,16 @@ function tryJumpNow(): boolean {
       // already open at that point.
     }
     // The visible landing marker: a self-drawn per-line highlight over the
-    // range. The editor's own selection is near-invisible while unfocused
-    // (and whether it renders at all depends on the editor's drawSelection
-    // setup), so the overlay — independent of focus — marks the lines.
-    const lineEl = highlightTargetLines(view, startLine, lastLine)
+    // range. The overlay needs the START line to be RENDERED — on a freshly
+    // opened file the dispatch's centered scroll lands in a later measure
+    // cycle, so the viewport is often still at the top on this first attempt.
+    // Defer the paint to retry ticks instead of trusting a clamped domAtPos
+    // lookup (which previously centered on a wrong line = the visible yank).
+    const lineEl = establishRangeHighlight(view, el, startLine, lastLine)
     if (lineEl !== null) {
-      // Self-correcting centering. The centered scroll effect targets the
-      // viewport center, but late layout shifts (font load, gutter mount,
-      // CodeMirror's own "keep the selection visible" pass a frame or two
-      // later) can still leave the line a few lines off-center. These
-      // verification passes re-measure from live rects shortly after the
-      // jump and re-center only when the line is STILL VISIBLE yet clearly
-      // off-center — idempotent, and never fighting the user once they
-      // scrolled the line away.
-      const verify = (): void => centerLineElement(lineEl, 10)
-      window.requestAnimationFrame(() => { window.requestAnimationFrame(verify) })
-      window.setTimeout(verify, 220)
+      scheduleCenterVerification(lineEl)
+    } else {
+      pendingPaint = { view, contentEl: el, startLine, endLine: lastLine, deadline: Date.now() + 3000 }
     }
     pending = null
     return true
@@ -368,15 +373,26 @@ function tryJumpNow(): boolean {
 /** Poll until the async editor mount lets us jump (or a deadline passes). */
 function scheduleJump(bs: BetterSidebarService, absolute: string, line: number, endLine?: number): void {
   pending = { bs, absolute, line, endLine }
+  pendingPaint = null
   const deadline = Date.now() + 5000
   const tick = (): void => {
-    if (pending === null) return
-    if (Date.now() > deadline) {
-      pending = null
-      return
+    const alive = Date.now() <= deadline
+    // Phase 1: land the selection + centered scroll (once).
+    if (pending !== null) {
+      if (!alive) {
+        pending = null
+      } else if (tryJumpNow()) {
+        pending = null // settled; tryJumpNow may have armed a deferred paint
+      }
     }
-    if (tryJumpNow()) return
-    window.setTimeout(tick, 100)
+    // Phase 2: on freshly opened files the target line renders a few frames
+    // later — retry the overlay establishment until the range shows.
+    if (pendingPaint !== null) {
+      if (!alive || retryPendingPaint()) pendingPaint = null
+    }
+    if (pending !== null || pendingPaint !== null) {
+      window.setTimeout(tick, 100)
+    }
   }
   // Small delay so the sidebar can switch to the target tab before we scan.
   window.setTimeout(tick, 150)
@@ -435,27 +451,51 @@ function paintRangeLines(): void {
   }
 }
 
-/**
- * Paint the overlay over a line range [startLine, endLine]. CodeMirror
- * virtualizes lines (only the rendered window exists in the DOM), so the
- * overlay is painted per rendered line and refreshed on scroller scroll —
- * lines entering the viewport pick up the class as they render. The overlay
- * PERSISTS until the next jump lands (IDE-selection semantics).
- * @returns the START line's `.cm-line` element, or null when not found.
- */
-function highlightTargetLines(view: EditorViewLike, startLine: number, endLine: number): HTMLElement | null {
-  let node: HTMLElement | null = null
+/** Map one rendered `.cm-line` element to its document line number (0 = unknown). */
+function lineNumberOfEl(view: EditorViewLike, el: HTMLElement): number {
+  const rect = el.getBoundingClientRect()
+  let pos: number | null = null
   try {
-    const from = view.state.doc.line(startLine).from
-    const loc = view.domAtPos(from)
-    node = loc.node instanceof HTMLElement ? loc.node : loc.node.parentElement
-    for (let depth = 0; depth < 6 && node !== null; depth += 1) {
-      if (node.classList.contains('cm-line')) break
-      node = node.parentElement
-    }
-    if (node === null || !node.classList.contains('cm-line')) return null
-    const scrollerEl = node.closest('.cm-scroller')
+    pos = view.posAtCoords({ x: rect.left + 1, y: rect.top + rect.height / 2 })
+  } catch {
+    pos = null
+  }
+  if (pos === null) return 0
+  try {
+    return view.state.doc.lineAt(pos).number
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Find the rendered `.cm-line` element for an exact line number. Returns null
+ * while the target line is outside the rendered viewport — CodeMirror
+ * virtualizes lines and `domAtPos` CLAMPS to the nearest rendered line, so an
+ * unrendered target must never be located through domAtPos (that clamp is
+ * what previously centered on a wrong line and left a freshly opened file's
+ * range unpainted until the user scrolled).
+ */
+function findLineElement(view: EditorViewLike, scroller: HTMLElement, target: number): HTMLElement | null {
+  for (const raw of Array.from(scroller.querySelectorAll('.cm-line'))) {
+    const el = raw as HTMLElement
+    if (lineNumberOfEl(view, el) === target) return el
+  }
+  return null
+}
+
+/**
+ * Establish the range overlay once the START line is actually rendered.
+ * @param contentEl the editor's `.cm-content` element (locates the scroller).
+ * @returns the VERIFIED start-line element, or null while the target is not
+ * in the rendered viewport yet (the caller retries on later ticks).
+ */
+function establishRangeHighlight(view: EditorViewLike, contentEl: HTMLElement, startLine: number, endLine: number): HTMLElement | null {
+  try {
+    const scrollerEl = contentEl.closest('.cm-scroller')
     if (scrollerEl === null) return null
+    const startEl = findLineElement(view, scrollerEl as HTMLElement, startLine)
+    if (startEl === null) return null
     clearLineHighlight()
     const onScroll = (): void => {
       if (paintQueued) return
@@ -465,11 +505,34 @@ function highlightTargetLines(view: EditorViewLike, startLine: number, endLine: 
     activeRange = { scroller: scrollerEl as HTMLElement, view, start: startLine, end: endLine, onScroll }
     scrollerEl.addEventListener('scroll', onScroll, { passive: true })
     paintRangeLines()
-    return node
+    return startEl
   } catch {
     // Best-effort decoration: never break the jump on a DOM drift.
     return null
   }
+}
+
+/**
+ * Self-correcting centering passes: re-measure from live rects shortly after
+ * the jump and re-center only when the (verified) start line is still visible
+ * yet clearly off-center — idempotent, and never fighting the user once they
+ * scrolled the line away.
+ */
+function scheduleCenterVerification(lineEl: HTMLElement): void {
+  const verify = (): void => centerLineElement(lineEl, 10)
+  window.requestAnimationFrame(() => { window.requestAnimationFrame(verify) })
+  window.setTimeout(verify, 220)
+}
+
+/** Retry a deferred overlay establishment; true when settled (or expired). */
+function retryPendingPaint(): boolean {
+  const pp = pendingPaint
+  if (pp === null) return true
+  if (Date.now() > pp.deadline) return true
+  const lineEl = establishRangeHighlight(pp.view, pp.contentEl, pp.startLine, pp.endLine)
+  if (lineEl === null) return false
+  scheduleCenterVerification(lineEl)
+  return true
 }
 
 /**
