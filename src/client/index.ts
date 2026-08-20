@@ -346,15 +346,18 @@ function tryJumpNow(): boolean {
     // (and whether it renders at all depends on the editor's drawSelection
     // setup), so the overlay — independent of focus — marks the lines.
     const lineEl = highlightTargetLines(view, startLine, lastLine)
-    if (lineEl !== null && !usedEffect) {
-      // Manual fallback path only (the effect path already centered): apply
-      // on successive frames AND once after 150ms — each pass recomputes
-      // from live rects, so the last writer is our centering rather than
-      // CodeMirror's minimal scroll.
-      const center = (): void => centerLineElement(lineEl)
-      window.requestAnimationFrame(center)
-      window.requestAnimationFrame(() => { window.requestAnimationFrame(center) })
-      window.setTimeout(center, 150)
+    if (lineEl !== null) {
+      // Self-correcting centering. The centered scroll effect targets the
+      // viewport center, but late layout shifts (font load, gutter mount,
+      // CodeMirror's own "keep the selection visible" pass a frame or two
+      // later) can still leave the line a few lines off-center. These
+      // verification passes re-measure from live rects shortly after the
+      // jump and re-center only when the line is STILL VISIBLE yet clearly
+      // off-center — idempotent, and never fighting the user once they
+      // scrolled the line away.
+      const verify = (): void => centerLineElement(lineEl, 10)
+      window.requestAnimationFrame(() => { window.requestAnimationFrame(verify) })
+      window.setTimeout(verify, 220)
     }
     pending = null
     return true
@@ -471,17 +474,20 @@ function highlightTargetLines(view: EditorViewLike, startLine: number, endLine: 
 
 /**
  * Center one `.cm-line` element inside its `.cm-scroller` viewport.
- * CodeMirror's own `scrollIntoView` only guarantees minimal visibility (the
- * line usually parks at a viewport edge); recomputing the delta from live
- * rects on the next frame reliably lands the line mid-viewport.
+ * `tolerance` skips sub-pixel/near-center nudges; when the line is scrolled
+ * fully OUT of view the call does nothing, so post-jump verification passes
+ * never yank the viewport back after the user scrolls away on purpose.
  */
-function centerLineElement(el: HTMLElement): void {
+function centerLineElement(el: HTMLElement, tolerance = 0): void {
   const scroller = el.closest('.cm-scroller')
   if (scroller === null) return
   const scrollerRect = scroller.getBoundingClientRect()
   const lineRect = el.getBoundingClientRect()
+  // Only adjust while the line is still (at least partially) on screen.
+  if (lineRect.bottom < scrollerRect.top || lineRect.top > scrollerRect.bottom) return
   const delta = (lineRect.top + lineRect.height / 2) - (scrollerRect.top + scrollerRect.height / 2)
-  if (delta !== 0) scroller.scrollTop += delta
+  if (Math.abs(delta) <= tolerance || tolerance === 0 && delta === 0) return
+  scroller.scrollTop += delta
 }
 
 // ── Open a parsed reference ─────────────────────────────────────────────────
