@@ -1,0 +1,13 @@
+# dsh-file-link bundle patch.
+#
+# Installed through the official CLI:
+#
+#   dsh plugin --profile <name> add github:rockerzhao/dsh-file-link#<commit>
+#
+# the command reconciles `dsh.profile.bundles` and, seeing this declaration,
+# appends `dsh-file-link` to the bundle stack. The profile boot merges this
+# single `insert` row, which mounts the package's host export (lib/index.js).
+# The browser half (lib/client.js) is loaded through the `dsh.client` manifest.
+- insert:
+    - id: file-link
+      name: 'dsh-file-link'

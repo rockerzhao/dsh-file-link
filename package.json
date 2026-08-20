@@ -1,0 +1,48 @@
+{
+  "name": "dsh-file-link",
+  "version": "0.1.0",
+  "description": "Clickable file:line references in DSH replies — click a path like utils.sh:3 to open it in the dsh-better-sidebar editor and jump to that line.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rockerzhao/dsh-file-link"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "tsdown": "^0.22.14",
+    "typescript": "^5.6.0"
+  }
+}
