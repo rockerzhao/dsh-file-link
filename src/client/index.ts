@@ -199,6 +199,7 @@ function forceRightPanelLanding(bs: BetterSidebarService): void {
 interface EditorViewLike {
   state: { doc: { length: number; lines: number; line(n: number): { from: number; to: number } } }
   dispatch(spec: { selection: { anchor: number; head?: number }; scrollIntoView: boolean }): void
+  domAtPos(pos: number): { node: Node; offset: number }
 }
 
 /** Walk up from a `.cm-content` element reading CodeMirror's `cmTile` handle. */
@@ -296,6 +297,11 @@ function tryJumpNow(): boolean {
       // A dispatch surface drift must never break the click — the file is
       // already open at that point.
     }
+    // The visible landing marker: a self-drawn full-line highlight. The
+    // editor's own selection is near-invisible while unfocused (and whether
+    // it renders at all depends on the editor's drawSelection setup), so the
+    // overlay — independent of focus — is what makes the line unmistakable.
+    highlightTargetLine(view, lineInfo.from)
     pending = null
     return true
   }
@@ -317,6 +323,43 @@ function scheduleJump(bs: BetterSidebarService, absolute: string, line: number):
   }
   // Small delay so the sidebar can switch to the target tab before we scan.
   window.setTimeout(tick, 150)
+}
+
+// ── Visible line highlight (self-drawn overlay on the `.cm-line` element) ───
+
+const LINE_CLASS = 'dsh-file-link-line'
+
+let highlightedLine: HTMLElement | null = null
+let highlightTimer: number | null = null
+
+function clearLineHighlight(): void {
+  if (highlightTimer !== null) {
+    window.clearTimeout(highlightTimer)
+    highlightTimer = null
+  }
+  if (highlightedLine !== null) {
+    highlightedLine.classList.remove(LINE_CLASS)
+    highlightedLine = null
+  }
+}
+
+/** Paint the target line with the overlay class for a few seconds. */
+function highlightTargetLine(view: EditorViewLike, from: number): void {
+  try {
+    const loc = view.domAtPos(from)
+    let node: HTMLElement | null = loc.node instanceof HTMLElement ? loc.node : loc.node.parentElement
+    for (let depth = 0; depth < 6 && node !== null; depth += 1) {
+      if (node.classList.contains('cm-line')) break
+      node = node.parentElement
+    }
+    if (node === null || !node.classList.contains('cm-line')) return
+    clearLineHighlight()
+    node.classList.add(LINE_CLASS)
+    highlightedLine = node
+    highlightTimer = window.setTimeout(clearLineHighlight, 3500)
+  } catch {
+    // Best-effort decoration: never break the jump on a DOM drift.
+  }
 }
 
 // ── Open a parsed reference ─────────────────────────────────────────────────
@@ -388,6 +431,7 @@ function injectStyles(): HTMLStyleElement {
   tag.textContent = [
     `code.${LINK_CLASS}{color:var(--dsw-alias-state-business-primary,var(--dsw-static-blue-450,#3b82f6));cursor:pointer;}`,
     `code.${LINK_CLASS}:hover{text-decoration:underline;}`,
+    `.${LINE_CLASS}{background:rgba(64,140,255,.22)!important;box-shadow:inset 3px 0 0 var(--dsw-alias-state-business-primary,#3b82f6);}`,
   ].join('\n')
   document.head.appendChild(tag)
   return tag
