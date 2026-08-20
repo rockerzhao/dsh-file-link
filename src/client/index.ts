@@ -301,7 +301,13 @@ function tryJumpNow(): boolean {
     // editor's own selection is near-invisible while unfocused (and whether
     // it renders at all depends on the editor's drawSelection setup), so the
     // overlay — independent of focus — is what makes the line unmistakable.
-    highlightTargetLine(view, lineInfo.from)
+    const lineEl = highlightTargetLine(view, lineInfo.from)
+    if (lineEl !== null) {
+      // Center after CodeMirror's own minimal scroll settles: the next-frame
+      // adjustment recomputes from live rects, so the final position is
+      // mid-viewport rather than parked at an edge.
+      window.requestAnimationFrame(() => { centerLineElement(lineEl) })
+    }
     pending = null
     return true
   }
@@ -330,36 +336,53 @@ function scheduleJump(bs: BetterSidebarService, absolute: string, line: number):
 const LINE_CLASS = 'dsh-file-link-line'
 
 let highlightedLine: HTMLElement | null = null
-let highlightTimer: number | null = null
 
+/** Drop the current line highlight (called when a new jump lands). */
 function clearLineHighlight(): void {
-  if (highlightTimer !== null) {
-    window.clearTimeout(highlightTimer)
-    highlightTimer = null
-  }
   if (highlightedLine !== null) {
     highlightedLine.classList.remove(LINE_CLASS)
     highlightedLine = null
   }
 }
 
-/** Paint the target line with the overlay class for a few seconds. */
-function highlightTargetLine(view: EditorViewLike, from: number): void {
+/**
+ * Paint the target line with the overlay class. The highlight PERSISTS until
+ * the next jump lands (IDE-selection semantics — it never times out).
+ * @returns the highlighted `.cm-line` element, or null when not found.
+ */
+function highlightTargetLine(view: EditorViewLike, from: number): HTMLElement | null {
+  let node: HTMLElement | null = null
   try {
     const loc = view.domAtPos(from)
-    let node: HTMLElement | null = loc.node instanceof HTMLElement ? loc.node : loc.node.parentElement
+    node = loc.node instanceof HTMLElement ? loc.node : loc.node.parentElement
     for (let depth = 0; depth < 6 && node !== null; depth += 1) {
       if (node.classList.contains('cm-line')) break
       node = node.parentElement
     }
-    if (node === null || !node.classList.contains('cm-line')) return
+    if (node === null || !node.classList.contains('cm-line')) return null
     clearLineHighlight()
     node.classList.add(LINE_CLASS)
     highlightedLine = node
-    highlightTimer = window.setTimeout(clearLineHighlight, 3500)
+    return node
   } catch {
     // Best-effort decoration: never break the jump on a DOM drift.
+    return null
   }
+}
+
+/**
+ * Center one `.cm-line` element inside its `.cm-scroller` viewport.
+ * CodeMirror's own `scrollIntoView` only guarantees minimal visibility (the
+ * line usually parks at a viewport edge); recomputing the delta from live
+ * rects on the next frame reliably lands the line mid-viewport.
+ */
+function centerLineElement(el: HTMLElement): void {
+  const scroller = el.closest('.cm-scroller')
+  if (scroller === null) return
+  const scrollerRect = scroller.getBoundingClientRect()
+  const lineRect = el.getBoundingClientRect()
+  const delta = (lineRect.top + lineRect.height / 2) - (scrollerRect.top + scrollerRect.height / 2)
+  if (delta !== 0) scroller.scrollTop += delta
 }
 
 // ── Open a parsed reference ─────────────────────────────────────────────────
