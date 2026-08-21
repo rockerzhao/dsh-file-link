@@ -408,21 +408,28 @@ interface ActiveRange {
   start: number
   end: number
   onScroll: () => void
+  /** Removes the follow-on-scroll behavior; called on the user's next click. */
+  stopFollowing: (event: Event) => void
 }
 
 let activeRange: ActiveRange | null = null
 let paintQueued = false
 
+/** Remove every overlay class in the document (detached nodes included). */
+function sweepLineClasses(): void {
+  for (const el of Array.from(document.querySelectorAll(`.${LINE_CLASS}`))) {
+    el.classList.remove(LINE_CLASS)
+  }
+}
+
 /** Drop the current range highlight (called when a new jump lands). */
 function clearLineHighlight(): void {
   if (activeRange !== null) {
     activeRange.scroller.removeEventListener('scroll', activeRange.onScroll)
+    document.removeEventListener('pointerdown', activeRange.stopFollowing, true)
     activeRange = null
   }
-  // Sweep any straggler classes (also covers detached nodes from old panes).
-  for (const el of Array.from(document.querySelectorAll(`.${LINE_CLASS}`))) {
-    el.classList.remove(LINE_CLASS)
-  }
+  sweepLineClasses()
 }
 
 /** Re-paint the overlay on the RENDERED lines inside the active range. */
@@ -502,8 +509,26 @@ function establishRangeHighlight(view: EditorViewLike, contentEl: HTMLElement, s
       paintQueued = true
       window.requestAnimationFrame(paintRangeLines)
     }
-    activeRange = { scroller: scrollerEl as HTMLElement, view, start: startLine, end: endLine, onScroll }
+    // The overlay follows scrolling only until the user's NEXT CLICK
+    // anywhere. Without this, the repaint listener outlives the reading
+    // session and CodeMirror's line recycling makes the highlight look like
+    // a zombie: it seems gone, then resurrects on the next scroll. A click
+    // INSIDE the editor also sweeps the painted overlay entirely (IDE
+    // semantics: placing the caret replaces the selection); a click
+    // elsewhere merely stops the following — what is painted stays until
+    // the line elements recycle naturally.
+    const stopFollowing = (event: Event): void => {
+      document.removeEventListener('pointerdown', stopFollowing, true)
+      if (activeRange === null) return
+      activeRange.scroller.removeEventListener('scroll', activeRange.onScroll)
+      if (event.target instanceof Element && event.target.closest('.cm-scroller') !== null) {
+        sweepLineClasses()
+      }
+      activeRange = null
+    }
+    activeRange = { scroller: scrollerEl as HTMLElement, view, start: startLine, end: endLine, onScroll, stopFollowing }
     scrollerEl.addEventListener('scroll', onScroll, { passive: true })
+    document.addEventListener('pointerdown', stopFollowing, true)
     paintRangeLines()
     return startEl
   } catch {
