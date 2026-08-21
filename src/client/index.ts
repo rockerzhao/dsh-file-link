@@ -415,20 +415,20 @@ function scheduleJump(bs: BetterSidebarService, absolute: string, line: number, 
 const LINE_CLASS = 'dsh-file-link-line'
 
 interface ActiveRange {
-  scroller: HTMLElement
-  view: EditorViewLike
   start: number
   end: number
-  onScroll: () => void
-  /** Repaints whenever CodeMirror re-renders line elements (scroll OR the
-   *  silent metric re-renders that recycle lines without a scroll event). */
+  /** Repaints on any editor DOM churn anywhere. Anchored at document.body —
+   *  NOT at the scroller: better-sidebar re-mounts the whole editor (new
+   *  .cm-scroller, new CodeMirror) on tab switches and viewer re-matches, and
+   *  an observer left on the replaced scroller silently watches a detached
+   *  tree while the fresh editor shows no highlight. The live editor is
+   *  re-queried on EVERY repaint, so any remount is self-healing. */
   observer: MutationObserver
-  /** Removes the follow-on-scroll behavior; called on the user's next click. */
+  /** Removes the follow behavior; called on the user's next click. */
   stopFollowing: (event: Event) => void
 }
 
 let activeRange: ActiveRange | null = null
-let paintQueued = false
 
 /** Remove every overlay class in the document (detached nodes included). */
 function sweepLineClasses(): void {
@@ -440,7 +440,6 @@ function sweepLineClasses(): void {
 /** Drop the current range highlight (called when a new jump lands). */
 function clearLineHighlight(): void {
   if (activeRange !== null) {
-    activeRange.scroller.removeEventListener('scroll', activeRange.onScroll)
     activeRange.observer.disconnect()
     document.removeEventListener('pointerdown', activeRange.stopFollowing, true)
     activeRange = null
@@ -448,30 +447,40 @@ function clearLineHighlight(): void {
   sweepLineClasses()
 }
 
+/** The LIVE visible `.cm-content` (re-queried every call — remount-proof). */
+function liveVisibleContent(): HTMLElement | null {
+  for (const raw of Array.from(document.querySelectorAll('.cm-content'))) {
+    const el = raw as HTMLElement
+    if (el.offsetParent !== null || el.getBoundingClientRect().width > 0) return el
+  }
+  return null
+}
+
 /** Re-paint the overlay on the RENDERED lines inside the active range. */
 function paintRangeLines(): void {
-  paintQueued = false
   const ar = activeRange
   if (ar === null) return
-  const doc = ar.view.state.doc
-  for (const raw of Array.from(ar.scroller.querySelectorAll('.cm-line'))) {
+  const content = liveVisibleContent()
+  if (content === null) return
+  const view = contentView(content)
+  if (view === null) return
+  const doc = view.state.doc
+  for (const raw of Array.from(content.querySelectorAll('.cm-line'))) {
     const el = raw as HTMLElement
-    const rect = el.getBoundingClientRect()
-    let pos: number | null = null
-    try {
-      pos = ar.view.posAtCoords({ x: rect.left + 1, y: rect.top + rect.height / 2 })
-    } catch {
-      pos = null
-    }
-    if (pos === null) continue
-    let num = 0
-    try {
-      num = doc.lineAt(pos).number
-    } catch {
-      continue
-    }
+    const num = lineNumberOfEl(view, el)
     if (num >= ar.start && num <= ar.end) el.classList.add(LINE_CLASS)
   }
+}
+
+/** The CodeMirror view behind a `.cm-content` element, via the public cmTile. */
+function contentView(content: HTMLElement): EditorViewLike | null {
+  let node: HTMLElement | null = content
+  while (node !== null) {
+    const tile = (node as unknown as { cmTile?: { root?: { view?: EditorViewLike } } }).cmTile
+    if (tile !== undefined && tile.root?.view !== undefined) return tile.root.view
+    node = node.parentElement
+  }
+  return null
 }
 
 /** Map one rendered `.cm-line` element to its document line number (0 = unknown). */
@@ -509,7 +518,7 @@ function findLineElement(view: EditorViewLike, scroller: HTMLElement, target: nu
 
 /**
  * Establish the range overlay once the START line is actually rendered.
- * @param contentEl the editor's `.cm-content` element (locates the scroller).
+ * @param contentEl the editor's `.cm-content` element (verified live).
  * @returns the VERIFIED start-line element, or null while the target is not
  * in the rendered viewport yet (the caller retries on later ticks).
  */
@@ -520,23 +529,16 @@ function establishRangeHighlight(view: EditorViewLike, contentEl: HTMLElement, s
     const startEl = findLineElement(view, scrollerEl as HTMLElement, startLine)
     if (startEl === null) return null
     clearLineHighlight()
-    const onScroll = (): void => {
-      if (paintQueued) return
-      paintQueued = true
-      window.requestAnimationFrame(paintRangeLines)
-    }
-    // The overlay follows scrolling only until the user's NEXT CLICK
+    // The overlay follows editor churn only until the user's NEXT click
     // anywhere. Without this, the repaint listener outlives the reading
     // session and CodeMirror's line recycling makes the highlight look like
     // a zombie: it seems gone, then resurrects on the next scroll. A click
     // INSIDE the editor also sweeps the painted overlay entirely (IDE
     // semantics: placing the caret replaces the selection); a click
-    // elsewhere merely stops the following — what is painted stays until
-    // the line elements recycle naturally.
+    // elsewhere merely stops the following.
     const stopFollowing = (event: Event): void => {
       document.removeEventListener('pointerdown', stopFollowing, true)
       if (activeRange === null) return
-      activeRange.scroller.removeEventListener('scroll', activeRange.onScroll)
       activeRange.observer.disconnect()
       if (event.target instanceof Element && event.target.closest('.cm-scroller') !== null) {
         sweepLineClasses()
@@ -544,17 +546,20 @@ function establishRangeHighlight(view: EditorViewLike, contentEl: HTMLElement, s
       activeRange = null
     }
     // childList-only (no attributes): my own class paints must not feed back
-    // into the observer. Line elements being created/destroyed — by scrolling
-    // OR by CodeMirror's silent metric re-renders — trigger a repaint.
+    // into the observer. ANY editor line churn — scrolling, silent metric
+    // re-renders, or better-sidebar REMOUNTING the whole editor — triggers a
+    // repaint; the repaint re-queries the live editor, so remounts heal.
+    // Synchronous on purpose: a rAF-throttled repaint DEADLOCKS whenever the
+    // window is backgrounded (rAF frozen → the queued flag never clears →
+    // the observer goes permanently deaf — exactly the intermittent
+    // "highlight missing until I scroll" symptom). The paint itself is cheap
+    // (~viewport-sized element list, class adds only).
     const onDomChange = (): void => {
-      if (paintQueued) return
-      paintQueued = true
-      window.requestAnimationFrame(paintRangeLines)
+      paintRangeLines()
     }
     const observer = new MutationObserver(onDomChange)
-    observer.observe(scrollerEl, { childList: true, subtree: true })
-    activeRange = { scroller: scrollerEl as HTMLElement, view, start: startLine, end: endLine, onScroll, observer, stopFollowing }
-    scrollerEl.addEventListener('scroll', onScroll, { passive: true })
+    observer.observe(document.body, { childList: true, subtree: true })
+    activeRange = { start: startLine, end: endLine, observer, stopFollowing }
     document.addEventListener('pointerdown', stopFollowing, true)
     paintRangeLines()
     return startEl
