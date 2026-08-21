@@ -391,11 +391,14 @@ function scheduleJump(bs: BetterSidebarService, absolute: string, line: number, 
       if (!alive || retryPendingPaint()) pendingPaint = null
     }
     if (pending !== null || pendingPaint !== null) {
-      window.setTimeout(tick, 100)
+      // Fast cadence: on a fresh open the editor mounts mid-poll, and every
+      // saved frame between mount and the centered scroll shrinks the
+      // visible top-of-file flash before the jump lands.
+      window.setTimeout(tick, 50)
     }
   }
   // Small delay so the sidebar can switch to the target tab before we scan.
-  window.setTimeout(tick, 150)
+  window.setTimeout(tick, 120)
 }
 
 // ── Visible line highlight (self-drawn overlay on the `.cm-line` element) ───
@@ -408,6 +411,9 @@ interface ActiveRange {
   start: number
   end: number
   onScroll: () => void
+  /** Repaints whenever CodeMirror re-renders line elements (scroll OR the
+   *  silent metric re-renders that recycle lines without a scroll event). */
+  observer: MutationObserver
   /** Removes the follow-on-scroll behavior; called on the user's next click. */
   stopFollowing: (event: Event) => void
 }
@@ -426,6 +432,7 @@ function sweepLineClasses(): void {
 function clearLineHighlight(): void {
   if (activeRange !== null) {
     activeRange.scroller.removeEventListener('scroll', activeRange.onScroll)
+    activeRange.observer.disconnect()
     document.removeEventListener('pointerdown', activeRange.stopFollowing, true)
     activeRange = null
   }
@@ -521,12 +528,23 @@ function establishRangeHighlight(view: EditorViewLike, contentEl: HTMLElement, s
       document.removeEventListener('pointerdown', stopFollowing, true)
       if (activeRange === null) return
       activeRange.scroller.removeEventListener('scroll', activeRange.onScroll)
+      activeRange.observer.disconnect()
       if (event.target instanceof Element && event.target.closest('.cm-scroller') !== null) {
         sweepLineClasses()
       }
       activeRange = null
     }
-    activeRange = { scroller: scrollerEl as HTMLElement, view, start: startLine, end: endLine, onScroll, stopFollowing }
+    // childList-only (no attributes): my own class paints must not feed back
+    // into the observer. Line elements being created/destroyed — by scrolling
+    // OR by CodeMirror's silent metric re-renders — trigger a repaint.
+    const onDomChange = (): void => {
+      if (paintQueued) return
+      paintQueued = true
+      window.requestAnimationFrame(paintRangeLines)
+    }
+    const observer = new MutationObserver(onDomChange)
+    observer.observe(scrollerEl, { childList: true, subtree: true })
+    activeRange = { scroller: scrollerEl as HTMLElement, view, start: startLine, end: endLine, onScroll, observer, stopFollowing }
     scrollerEl.addEventListener('scroll', onScroll, { passive: true })
     document.addEventListener('pointerdown', stopFollowing, true)
     paintRangeLines()
