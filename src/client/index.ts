@@ -275,20 +275,13 @@ interface PendingJump {
   absolute: string
   line: number
   endLine?: number
-}
-
-/** A jump whose selection+scroll landed, but whose overlay is not painted yet
- *  because the target line was outside the rendered viewport (fresh open). */
-interface PendingPaint {
-  view: EditorViewLike
-  contentEl: HTMLElement
-  startLine: number
-  endLine: number
-  deadline: number
+  /** Set once the first dispatch landed; arms the user-bail listeners. */
+  dispatched: boolean
+  /** Set when the user clicks or wheels before convergence — cancels the loop. */
+  bailed: boolean
 }
 
 let pending: PendingJump | null = null
-let pendingPaint: PendingPaint | null = null
 
 /** Try once to find the target editor and jump; true when settled. */
 function tryJumpNow(): boolean {
@@ -324,26 +317,27 @@ function tryJumpNow(): boolean {
     const start = doc.line(startLine)
     const end = doc.line(lastLine)
     const head = end.to > start.from ? end.to : Math.min(start.from + 1, doc.length)
-    // Scroll strategy: prefer CodeMirror's OFFICIAL centered scroll effect
-    // (`EditorView.scrollIntoView(pos, { y: 'center' })`, reached through the
-    // view's own class) — CodeMirror computes the centered target itself, so
-    // there is no animation-frame race against its own scroll settling. Fall
-    // back to minimal scroll + manual next-frame re-centering when the static
-    // is not reachable.
-    let centerEffect: unknown
+
+    // CONVERGENCE LOOP, not one-shot. On a freshly mounted editor CodeMirror
+    // first renders an UNMEASURED viewport (collapsed geometry); a centered
+    // scroll dispatched into that state is silently swallowed (the target
+    // "is already visible" at scrollTop 0), which is exactly the
+    // intermittent "no highlight until I scroll" bug. So: re-dispatch the
+    // (idempotent) selection + centered scroll on EVERY tick and only settle
+    // once the target line is rendered AND actually on-screen — by then the
+    // geometry is measured, the scroll sticks, and the paint survives.
     try {
-      const ctor = view.constructor as unknown as {
-        scrollIntoView?: (pos: number, options: { y: 'center' }) => unknown
+      let centerEffect: unknown
+      try {
+        const ctor = view.constructor as unknown as {
+          scrollIntoView?: (pos: number, options: { y: 'center' }) => unknown
+        }
+        centerEffect = ctor.scrollIntoView?.(start.from, { y: 'center' })
+      } catch {
+        centerEffect = undefined
       }
-      centerEffect = ctor.scrollIntoView?.(start.from, { y: 'center' })
-    } catch {
-      centerEffect = undefined
-    }
-    let usedEffect = false
-    try {
       if (centerEffect !== undefined) {
         view.dispatch({ selection: { anchor: start.from, head }, effects: centerEffect })
-        usedEffect = true
       } else {
         view.dispatch({ selection: { anchor: start.from }, scrollIntoView: true })
         view.dispatch({ selection: { anchor: start.from, head } })
@@ -352,50 +346,65 @@ function tryJumpNow(): boolean {
       // A dispatch surface drift must never break the click — the file is
       // already open at that point.
     }
-    // The visible landing marker: a self-drawn per-line highlight over the
-    // range. The overlay needs the START line to be RENDERED — on a freshly
-    // opened file the dispatch's centered scroll lands in a later measure
-    // cycle, so the viewport is often still at the top on this first attempt.
-    // Defer the paint to retry ticks instead of trusting a clamped domAtPos
-    // lookup (which previously centered on a wrong line = the visible yank).
-    const lineEl = establishRangeHighlight(view, el, startLine, lastLine)
-    if (lineEl !== null) {
-      scheduleCenterVerification(lineEl)
-    } else {
-      pendingPaint = { view, contentEl: el, startLine, endLine: lastLine, deadline: Date.now() + 3000 }
+    if (!pending!.dispatched) armBailListeners()
+
+    // Converged? The start line must be rendered (findLineElement verifies by
+    // mapping rendered elements back to line numbers) and, whenever the
+    // document is scrollable, actually inside the scroller's viewport — a
+    // target "rendered" into the collapsed pre-measure geometry does not
+    // count, because the centered scroll was swallowed there.
+    const scrollerEl = el.closest('.cm-scroller')
+    if (scrollerEl === null) continue
+    const startEl = findLineElement(view, scrollerEl as HTMLElement, startLine)
+    if (startEl === null) continue
+    if (scrollerEl.scrollHeight > scrollerEl.clientHeight + 4) {
+      const sr = scrollerEl.getBoundingClientRect()
+      const lr = startEl.getBoundingClientRect()
+      if (lr.bottom <= sr.top || lr.top >= sr.bottom) continue
     }
+
+    const lineEl = establishRangeHighlight(view, el, startLine, lastLine)
+    if (lineEl === null) continue
+    scheduleCenterVerification(lineEl)
     pending = null
     return true
   }
   return false
 }
 
-/** Poll until the async editor mount lets us jump (or a deadline passes). */
+/**
+ * Cancel the convergence loop the moment the user takes over (any click, any
+ * wheel). Re-dispatching a centered scroll past that point would fight the
+ * user's own scrolling, which is worse than a missing highlight.
+ */
+function armBailListeners(): void {
+  const p = pending
+  if (p === null || p.dispatched) return
+  p.dispatched = true
+  const bail = (): void => {
+    document.removeEventListener('pointerdown', bail, true)
+    document.removeEventListener('wheel', bail, true)
+    if (pending === p) pending = null
+  }
+  document.addEventListener('pointerdown', bail, true)
+  document.addEventListener('wheel', bail, true)
+}
+
+/** Poll until the jump converges (or the deadline / a user action ends it). */
 function scheduleJump(bs: BetterSidebarService, absolute: string, line: number, endLine?: number): void {
-  pending = { bs, absolute, line, endLine }
-  pendingPaint = null
+  pending = { bs, absolute, line, endLine, dispatched: false, bailed: false }
   const deadline = Date.now() + 5000
   const tick = (): void => {
-    const alive = Date.now() <= deadline
-    // Phase 1: land the selection + centered scroll (once).
-    if (pending !== null) {
-      if (!alive) {
-        pending = null
-      } else if (tryJumpNow()) {
-        pending = null // settled; tryJumpNow may have armed a deferred paint
-      }
+    if (pending === null) return
+    if (Date.now() > deadline) {
+      pending = null
+      return
     }
-    // Phase 2: on freshly opened files the target line renders a few frames
-    // later — retry the overlay establishment until the range shows.
-    if (pendingPaint !== null) {
-      if (!alive || retryPendingPaint()) pendingPaint = null
-    }
-    if (pending !== null || pendingPaint !== null) {
-      // Fast cadence: on a fresh open the editor mounts mid-poll, and every
-      // saved frame between mount and the centered scroll shrinks the
-      // visible top-of-file flash before the jump lands.
-      window.setTimeout(tick, 50)
-    }
+    if (tryJumpNow()) return
+    // Fast cadence: on a fresh open the editor mounts mid-poll, and every
+    // saved frame between mount and the centered scroll shrinks the visible
+    // top-of-file flash before the jump lands.
+    window.setTimeout(tick, 50)
   }
   // Small delay so the sidebar can switch to the target tab before we scan.
   window.setTimeout(tick, 120)
@@ -565,17 +574,6 @@ function scheduleCenterVerification(lineEl: HTMLElement): void {
   const verify = (): void => centerLineElement(lineEl, 10)
   window.requestAnimationFrame(() => { window.requestAnimationFrame(verify) })
   window.setTimeout(verify, 220)
-}
-
-/** Retry a deferred overlay establishment; true when settled (or expired). */
-function retryPendingPaint(): boolean {
-  const pp = pendingPaint
-  if (pp === null) return true
-  if (Date.now() > pp.deadline) return true
-  const lineEl = establishRangeHighlight(pp.view, pp.contentEl, pp.startLine, pp.endLine)
-  if (lineEl === null) return false
-  scheduleCenterVerification(lineEl)
-  return true
 }
 
 /**
